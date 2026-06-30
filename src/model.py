@@ -1,129 +1,97 @@
+"""model.py — Cox proportional hazards model for ClinPredict (J&J).
+
+Implements survival analysis using the Cox partial likelihood, NOT
+generic binary classification. The Cox model estimates hazard ratios
+without specifying the baseline hazard.
+
+The partial likelihood for the Cox model:
+  L(beta) = product_i [ exp(beta * x_i) / sum_{j in R(t_i)} exp(beta * x_j) ]
+where R(t_i) is the risk set at time t_i.
+
+References
+----------
+Cox (1972), "Regression Models and Life-Tables." JRSS-B.
+"""
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+from scipy.optimize import minimize
+
+from src.core import concordance_index, kaplan_meier, logrank_test
 
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
+def cox_partial_likelihood(beta, X, times, events):
+    """Negative log partial likelihood for the Cox model.
+
+    L = sum_{i: event=1} [ beta * x_i - log(sum_{j in R(t_i)} exp(beta * x_j)) ]
+    """
+    beta = np.asarray(beta, dtype=float)
+    X = np.asarray(X, dtype=float)
+    times = np.asarray(times, dtype=float)
+    events = np.asarray(events, dtype=int)
+    risk_scores = X @ beta
+    log_lik = 0.0
+    for i in range(len(times)):
+        if events[i] != 1:
+            continue
+        risk_set = times >= times[i]
+        denom = np.log(np.sum(np.exp(risk_scores[risk_set])))
+        log_lik += risk_scores[i] - denom
+    return -log_lik
+
+
+def fit_cox_model(df, features, time_col, event_col, seed=42):
+    """Fit Cox proportional hazards model via partial likelihood optimization."""
+    X = df[features].values.astype(float)
+    times = df[time_col].values.astype(float)
+    events = df[event_col].values.astype(int)
+    n_features = X.shape[1]
+    result = minimize(
+        cox_partial_likelihood, np.zeros(n_features),
+        args=(X, times, events), method="Nelder-Mead",
+        options={"maxiter": 2000, "xatol": 1e-6},
     )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
+    beta = result.x
+    risk_scores = X @ beta
+    c_index = concordance_index(times, events, risk_scores)
+    hazard_ratios = np.exp(beta)
     return {
-        "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
-        "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
+        "beta": beta, "hazard_ratios": hazard_ratios,
+        "feature_names": features, "c_index": c_index,
+        "risk_scores": risk_scores, "converged": result.success,
     }
 
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
-        else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
+def fit_and_evaluate(data, seed=42):
+    """Fit Cox model and evaluate with C-index, KM curves, and log-rank test."""
+    df = data["df"]
+    features = data["features"]
+    time_col = data["time_col"]
+    event_col = data["event_col"]
 
+    cox = fit_cox_model(df, features, time_col, event_col, seed=seed)
 
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
-        scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-        })
-    return importances
+    # Kaplan-Meier by treatment group
+    control = df[df["treatment"] == 0]
+    treatment = df[df["treatment"] == 1]
+    km_control = kaplan_meier(control[time_col].values, control[event_col].values)
+    km_treatment = kaplan_meier(treatment[time_col].values, treatment[event_col].values)
 
+    # Log-rank test between treatment groups
+    lr = logrank_test(
+        control[time_col].values, control[event_col].values,
+        treatment[time_col].values, treatment[event_col].values,
+    )
 
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+    model = {"cox_model": cox, "km_control": km_control, "km_treatment": km_treatment}
+    metrics = {
+        "n_samples": data["n_samples"],
+        "event_rate": data["event_rate"],
+        "c_index": cox["c_index"],
+        "hazard_ratios": dict(zip(features, cox["hazard_ratios"].tolist())),
+        "logrank_chi2": lr["chi2"],
+        "logrank_p_value": lr["p_value"],
+        "median_survival": data["median_survival"],
+        "treatment_hazard_ratio": float(np.exp(cox["beta"][features.index("treatment")])),
+    }
+    return model, metrics
